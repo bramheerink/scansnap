@@ -464,9 +464,16 @@ static int do_register(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac
 
 static int try_handshake(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6]) {
     int fd = connect_tcp(scanner_ip, 53219, 5);
-    if (fd < 0) return -999;
+    if (fd < 0) {
+        if (g_debug) perror("  connect 53219");
+        return -999;
+    }
     uint8_t hello[16];
-    if (read_exact(fd, hello, 16) < 0) { close(fd); return -999; }
+    if (read_exact(fd, hello, 16) < 0) {
+        if (g_debug) perror("  read hello");
+        close(fd);
+        return -999;
+    }
 
     uint8_t pkt[128];
     hex_decode(
@@ -487,9 +494,16 @@ static int try_handshake(uint32_t scanner_ip, uint32_t local_ip, const uint8_t m
         memcpy(pkt + 52, g_pairing_key, klen);
     }
 
-    if (write_all(fd, pkt, 128) < 0) { close(fd); return -999; }
+    if (write_all(fd, pkt, 128) < 0) {
+        if (g_debug) perror("  write handshake");
+        close(fd);
+        return -999;
+    }
     uint8_t resp[256];
     ssize_t n = read(fd, resp, sizeof(resp));
+    if (n < 0 && g_debug) perror("  read handshake response");
+    if (n >= 0 && n < 12 && g_debug)
+        fprintf(stderr, "  short handshake response: %zd bytes\n", n);
     int32_t err = (n >= 12) ? (int32_t)get_be32(resp + 8) : -999;
     if (g_debug) fprintf(stderr, "  handshake result: %d\n", err);
     shutdown(fd, SHUT_RDWR);
@@ -508,7 +522,10 @@ static int do_handshake_conn1(uint32_t scanner_ip, uint32_t local_ip, const uint
         err = try_handshake(scanner_ip, local_ip, mac);
     }
     if (err != 0) {
-        fprintf(stderr, "Error: scanner rejected registration (error %d)\n", err);
+        if (err == -999)
+            fprintf(stderr, "Error: TCP handshake to scanner failed (error %d)\n", err);
+        else
+            fprintf(stderr, "Error: scanner rejected registration (error %d)\n", err);
         return -1;
     }
     return 0;
