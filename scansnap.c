@@ -64,6 +64,8 @@ static uint8_t  g_mac[6] = {0};
 static const char *g_pairing_key = NULL;
 static const char *g_handshake_dump_path = NULL;
 static char g_key_buf[64];
+static uint8_t g_device_info_tail[8] = {0};
+static bool g_have_device_info_tail = false;
 
 #define MAX_HANDSHAKE_PATCHES 16
 #define MAX_HANDSHAKE_PATCH_LEN 64
@@ -639,6 +641,10 @@ static int do_register(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac
     }
     close(fd);
     if (n <= 0) return -1;
+    if (n >= 132 && memcmp(buf, "VENS", 4) == 0) {
+        memcpy(g_device_info_tail, buf + 124, sizeof(g_device_info_tail));
+        g_have_device_info_tail = true;
+    }
     usleep(500000);
     return 0;
 }
@@ -656,16 +662,18 @@ static int try_handshake(uint32_t scanner_ip, uint32_t local_ip, const uint8_t m
         return -999;
     }
 
-    uint8_t pkt[128];
-    hex_decode(
-        "0000008056454e530000001100000000"
-        "CLIENT_MAC_REDACTED00000000000000000000"
-        "00061e000000000000000001c0a802ee"
-        "0000d7e131373531333231373831383000000000000000000000000000000000"
-        "00000000000000000000000000000000"
-        "0000000007ea040a14381100369c5a72"
-        "12800000ffffe3e00000000000000000",
-        pkt, sizeof(pkt));
+    uint8_t pkt[128] = {0};
+    put_be32(pkt, sizeof(pkt));
+    memcpy(pkt + 4, "VENS", 4);
+    put_be32(pkt + 8, 0x11);
+    pkt[33] = 0x06;
+    pkt[34] = 0x1e;
+    put_be32(pkt + 40, 1);
+    pkt[50] = 0xd7;
+    pkt[51] = 0xe1;
+    if (g_have_device_info_tail)
+        memcpy(pkt + 108, g_device_info_tail, sizeof(g_device_info_tail));
+    put_be32(pkt + 116, 0xffffe3e0);
     memcpy(pkt + 16, mac, 6);
     memcpy(pkt + 44, &local_ip, 4);
     if (g_pairing_key) {

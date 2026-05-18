@@ -1,3 +1,10 @@
 .git
 .gitignore
 scansnap
+*.pcapng
+handshake*.log
+*.pdf
+*.jpg
+.DS_Store
+config/
+output/

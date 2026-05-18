@@ -41,6 +41,25 @@ DOCKER
             scanner ports. That generally means `--network host`, or
             equivalent host-network support in your Docker runtime.
 
+QUICK START WITH DOCKER ON LINUX
+
+          On Linux, run the container with host networking so the
+     scanner sees the real host IP and MAC address:
+
+              mkdir -p output config/scansnap
+              printf 'YOUR_PAIRING_KEY\n' > config/scansnap/key
+              chmod 600 config/scansnap/key
+
+              docker build -t scansnap .
+              docker run --rm \
+                --network host \
+                -v "$PWD/output:/work" \
+                -v "$PWD/config:/config" \
+                scansnap -d -s SCANNER_IP -o /work/scan.pdf
+
+          Scanned files are written to `./output` on the host. Keep
+     ScanSnap Home stopped while using the container.
+
 DOCKER COMPOSE WORKFLOW
 
           The compose setup is meant for a Linux host on the same LAN
@@ -104,14 +123,14 @@ DOCKER COMPOSE WORKFLOW
                   --getkey-ip HOST_LAN_IP \
                   --getkey-name 'iX500-XXXXXXXXXX' \
                   --getkey-model 'ScanSnap iX500' \
-                  --getkey-mac 'SCANNER_MAC_REDACTED' \
-                  --getkey-tail 'DEVICE_INFO_TAIL_REDACTED'
+                  --getkey-mac 'SCANNER_MAC' \
+                  --getkey-tail 'TAIL_HEX_FROM_CAPTURE'
           - For firmware-specific debugging, dump the live TCP `0x11`
             handshake request/response and patch individual bytes:
 
                 ./scansnap -d -s SCANNER_IP -k KEY \
                   --dump-handshake handshake.log \
-                  --handshake-patch 108:DEVICE_INFO_TAIL_REDACTED
+                  --handshake-patch OFFSET:HEX_BYTES
 
           - Compare the first TCP `0x11` request across captures:
 
@@ -150,6 +169,45 @@ SCAN
           Error -4 means the scanner still has a busy/stale session.
      Turn the scanner off and on, make sure ScanSnap Home is not
      running, then retry.
+
+
+KNOWN LIMITATIONS
+
+          This v0.1 release supports active scans: the command starts
+     the scan and writes PDF/JPEG output. A physical scanner-button
+     daemon mode is not implemented yet.
+
+          The scanner only supports one active client session. If
+     ScanSnap Home or one of its background helpers is running, the
+     scanner may reject this tool with error -4. Stop ScanSnap Home
+     and restart the scanner if the stale session does not clear.
+
+          Docker Desktop networking on macOS/Windows is not equivalent
+     to Linux host networking. For reliable scanner access, run the
+     container on a Linux host in the same LAN as the scanner.
+
+
+SECURITY AND PRIVACY
+
+          Treat the pairing key as a secret. It authorizes a client to
+     talk to the scanner.
+
+          Packet captures and debug handshake logs can contain pairing
+     keys, MAC addresses, IP addresses and scanned image data. Do not
+     publish them.
+
+
+BUTTON DAEMON ROADMAP
+
+          The current captures suggest that ScanSnap Home keeps or
+     prepares a scanner session and then scans from that state when the
+     physical scanner button is pressed. They do not prove a simple
+     scanner-initiated callback that a passive client can wait for.
+
+          A future daemon mode should own the scanner session, keep
+     ScanSnap Home stopped, monitor scanner state, and write timestamped
+     PDFs when a button-triggered scan is detected. See
+     `docs/button-daemon-roadmap.md` for the proposed follow-up spec.
 
 
 OPTIONS
