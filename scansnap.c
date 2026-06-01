@@ -13,12 +13,30 @@
  *   -d          debug output
  *   -h          help
  *   --getkey    capture pairing key from ScanSnap Home
+ *   --getkey-ip IP
+ *               advertise this host IP in fake scanner mode
+ *   --getkey-name NAME
+ *               fake scanner device name (default: iX500-A0PB023744)
+ *   --getkey-model MODEL
+ *               fake scanner model string (default: ScanSnap iX500)
+ *   --getkey-mac MAC
+ *               fake scanner MAC (default: 00:80:92:58:c1:5c)
+ *   --getkey-tail HEX
+ *               8-byte hex tail for UDP device info response
  */
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <getopt.h>
+#include <net/if.h>
+#ifdef __APPLE__
+#include <net/if_dl.h>
+#endif
+#ifdef __linux__
+#include <netpacket/packet.h>
+#endif
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -41,9 +59,25 @@
 static bool g_debug = false;
 static volatile sig_atomic_t g_interrupted = 0;
 static uint32_t g_scanner_ip = 0;
+static uint32_t g_bind_ip = 0;
 static uint8_t  g_mac[6] = {0};
 static const char *g_pairing_key = NULL;
+static const char *g_handshake_dump_path = NULL;
 static char g_key_buf[64];
+static uint8_t g_device_info_tail[8] = {0};
+static bool g_have_device_info_tail = false;
+
+#define MAX_HANDSHAKE_PATCHES 16
+#define MAX_HANDSHAKE_PATCH_LEN 64
+
+struct handshake_patch {
+    size_t offset;
+    uint8_t data[MAX_HANDSHAKE_PATCH_LEN];
+    size_t len;
+};
+
+static struct handshake_patch g_handshake_patches[MAX_HANDSHAKE_PATCHES];
+static size_t g_handshake_patch_count = 0;
 
 struct page { uint8_t *data; size_t len; };
 
@@ -105,6 +139,131 @@ static int hex_decode(const char *hex, uint8_t *out, size_t max) {
         out[i / 2] = (uint8_t)byte;
     }
     return (int)(len / 2);
+}
+
+static int parse_mac_address(const char *mac_str, uint8_t mac[6]) {
+    unsigned int m[6];
+    if (!mac_str) return -1;
+    if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+               &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6)
+        return -1;
+    for (int i = 0; i < 6; i++) mac[i] = (uint8_t)m[i];
+    return 0;
+}
+
+static int detect_mac_for_local_ip(uint32_t local_ip, uint8_t mac[6]) {
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) < 0) return -1;
+
+    char iface[IFNAMSIZ] = {0};
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+        if (sin->sin_addr.s_addr == local_ip) {
+            snprintf(iface, sizeof(iface), "%s", ifa->ifa_name);
+            break;
+        }
+    }
+    if (iface[0] == '\0') {
+        freeifaddrs(ifaddr);
+        return -1;
+    }
+
+    for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || strcmp(ifa->ifa_name, iface) != 0) continue;
+#ifdef __APPLE__
+        if (ifa->ifa_addr->sa_family == AF_LINK) {
+            struct sockaddr_dl *sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+            if (sdl->sdl_alen == 6) {
+                memcpy(mac, LLADDR(sdl), 6);
+                freeifaddrs(ifaddr);
+                return 0;
+            }
+        }
+#endif
+#ifdef __linux__
+        if (ifa->ifa_addr->sa_family == AF_PACKET) {
+            struct sockaddr_ll *sll = (struct sockaddr_ll *)ifa->ifa_addr;
+            if (sll->sll_halen == 6) {
+                memcpy(mac, sll->sll_addr, 6);
+                freeifaddrs(ifaddr);
+                return 0;
+            }
+        }
+#endif
+    }
+
+    freeifaddrs(ifaddr);
+    return -1;
+}
+
+static void hex_encode(const uint8_t *buf, size_t len, char *out) {
+    static const char *hex = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2] = hex[(buf[i] >> 4) & 0x0f];
+        out[i * 2 + 1] = hex[buf[i] & 0x0f];
+    }
+    out[len * 2] = '\0';
+}
+
+static int parse_handshake_patch_spec(const char *spec, struct handshake_patch *patch) {
+    if (!spec || !patch) return -1;
+    const char *sep = strchr(spec, ':');
+    if (!sep || sep == spec || sep[1] == '\0') return -1;
+
+    char off_buf[32];
+    size_t off_len = (size_t)(sep - spec);
+    if (off_len >= sizeof(off_buf)) return -1;
+    memcpy(off_buf, spec, off_len);
+    off_buf[off_len] = '\0';
+
+    char *end = NULL;
+    unsigned long off = strtoul(off_buf, &end, 0);
+    if (!end || *end != '\0') return -1;
+
+    int data_len = hex_decode(sep + 1, patch->data, sizeof(patch->data));
+    if (data_len <= 0) return -1;
+
+    patch->offset = (size_t)off;
+    patch->len = (size_t)data_len;
+    return 0;
+}
+
+static int add_handshake_patch(const char *spec) {
+    if (g_handshake_patch_count >= MAX_HANDSHAKE_PATCHES) return -1;
+    if (parse_handshake_patch_spec(spec, &g_handshake_patches[g_handshake_patch_count]) < 0)
+        return -1;
+    g_handshake_patch_count++;
+    return 0;
+}
+
+static int apply_handshake_patches(uint8_t *pkt, size_t len) {
+    for (size_t i = 0; i < g_handshake_patch_count; i++) {
+        struct handshake_patch *p = &g_handshake_patches[i];
+        if (p->offset + p->len > len) return -1;
+        memcpy(pkt + p->offset, p->data, p->len);
+    }
+    return 0;
+}
+
+static void dump_packet_hex(const char *label, const uint8_t *buf, size_t len) {
+    char *hex = calloc(1, len * 2 + 1);
+    if (!hex) return;
+    hex_encode(buf, len, hex);
+
+    if (g_debug)
+        fprintf(stderr, "%s (%zu bytes): %s\n", label, len, hex);
+
+    if (g_handshake_dump_path && g_handshake_dump_path[0]) {
+        FILE *f = fopen(g_handshake_dump_path, "a");
+        if (f) {
+            fprintf(f, "%s %zu %s\n", label, len, hex);
+            fclose(f);
+        } else if (g_debug) {
+            perror("  open handshake dump");
+        }
+    }
+    free(hex);
 }
 
 static void put_be32(uint8_t *p, uint32_t v) {
@@ -189,6 +348,7 @@ static int bind_udp(uint16_t port) {
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port) };
+    if (g_bind_ip != 0) addr.sin_addr.s_addr = g_bind_ip;
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
     return fd;
 }
@@ -196,6 +356,14 @@ static int bind_udp(uint16_t port) {
 static int connect_tcp_ms(uint32_t ip, uint16_t port, int timeout_ms) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+
+    if (g_bind_ip != 0) {
+        struct sockaddr_in local = { .sin_family = AF_INET, .sin_addr.s_addr = g_bind_ip };
+        if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
+            close(fd);
+            return -1;
+        }
+    }
 
     /* Non-blocking connect + poll for reliable timeout */
     int flags = fcntl(fd, F_GETFL);
@@ -334,17 +502,28 @@ static uint32_t discover(void) {
 
 /* ── Network detection ────────────────────────────────────────────────── */
 
-static int detect_network(uint32_t scanner_ip, uint8_t mac[6], uint32_t *local_ip) {
-    /* Get local IP via UDP connect trick */
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return -1;
-    struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(1), .sin_addr.s_addr = scanner_ip };
-    connect(sock, (struct sockaddr *)&dst, sizeof(dst));
-    struct sockaddr_in local;
-    socklen_t slen = sizeof(local);
-    getsockname(sock, (struct sockaddr *)&local, &slen);
-    close(sock);
-    *local_ip = local.sin_addr.s_addr;
+static int detect_network(uint32_t scanner_ip, uint8_t mac[6], uint32_t *local_ip,
+                          const char *forced_client_ip, const char *forced_client_mac) {
+    if (forced_client_ip && forced_client_ip[0]) {
+        if (inet_pton(AF_INET, forced_client_ip, local_ip) != 1) return -1;
+    } else {
+        /* Get local IP via UDP connect trick */
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) return -1;
+        struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(1), .sin_addr.s_addr = scanner_ip };
+        connect(sock, (struct sockaddr *)&dst, sizeof(dst));
+        struct sockaddr_in local;
+        socklen_t slen = sizeof(local);
+        getsockname(sock, (struct sockaddr *)&local, &slen);
+        close(sock);
+        *local_ip = local.sin_addr.s_addr;
+    }
+
+    if (forced_client_mac && forced_client_mac[0])
+        return parse_mac_address(forced_client_mac, mac);
+
+    if (detect_mac_for_local_ip(*local_ip, mac) == 0)
+        return 0;
 
     /* Get interface name via `ip route get` */
     char ip_str[INET_ADDRSTRLEN];
@@ -417,7 +596,10 @@ static void send_d6_release(uint32_t scanner_ip, const uint8_t mac[6]) {
 static int do_register(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6]) {
     if (g_debug) fprintf(stderr, "UDP registration...\n");
     int fd = bind_udp(55264);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        if (g_debug) perror("  bind 55264");
+        return -1;
+    }
     set_timeout(fd, 3);
 
     uint8_t ip_bytes[4];
@@ -437,37 +619,61 @@ static int do_register(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac
             pkt[22] = 0xd7; pkt[23] = 0xe0;
             pkt[24] = (flags[m] >> 8) & 0xff;
             pkt[25] = flags[m] & 0xff;
-            sendto(fd, pkt, 32, 0, (struct sockaddr *)&dest, sizeof(dest));
+            if (sendto(fd, pkt, 32, 0, (struct sockaddr *)&dest, sizeof(dest)) < 0) {
+                if (g_debug) perror("  sendto 52217");
+                close(fd);
+                return -1;
+            }
         }
     }
 
     uint8_t buf[256];
-    ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, NULL, NULL);
+    struct sockaddr_in from;
+    socklen_t from_len = sizeof(from);
+    ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
     if (g_debug) {
-        if (n > 0) fprintf(stderr, "  registration OK (%zd bytes)\n", n);
-        else fprintf(stderr, "  no registration response\n");
+        if (n > 0) {
+            fprintf(stderr, "  registration OK (%zd bytes from %s)\n",
+                    n, inet_ntoa(from.sin_addr));
+        } else {
+            perror("  recvfrom 52217");
+        }
     }
     close(fd);
+    if (n <= 0) return -1;
+    if (n >= 132 && memcmp(buf, "VENS", 4) == 0) {
+        memcpy(g_device_info_tail, buf + 124, sizeof(g_device_info_tail));
+        g_have_device_info_tail = true;
+    }
     usleep(500000);
     return 0;
 }
 
 static int try_handshake(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6]) {
     int fd = connect_tcp(scanner_ip, 53219, 5);
-    if (fd < 0) return -999;
+    if (fd < 0) {
+        if (g_debug) perror("  connect 53219");
+        return -999;
+    }
     uint8_t hello[16];
-    if (read_exact(fd, hello, 16) < 0) { close(fd); return -999; }
+    if (read_exact(fd, hello, 16) < 0) {
+        if (g_debug) perror("  read hello");
+        close(fd);
+        return -999;
+    }
 
-    uint8_t pkt[128];
-    hex_decode(
-        "0000008056454e530000001100000000"
-        "026c251c14ce00000000000000000000"
-        "00061e000000000000000001c0a80199"
-        "0000d7e131373431333631383031373800000000000000000000000000000000"
-        "00000000000000000000000000000000"
-        "0000000007ea030a15001a0036c7c7e4"
-        "7a800000ffff9d900000000000000000",
-        pkt, sizeof(pkt));
+    uint8_t pkt[128] = {0};
+    put_be32(pkt, sizeof(pkt));
+    memcpy(pkt + 4, "VENS", 4);
+    put_be32(pkt + 8, 0x11);
+    pkt[33] = 0x06;
+    pkt[34] = 0x1e;
+    put_be32(pkt + 40, 1);
+    pkt[50] = 0xd7;
+    pkt[51] = 0xe1;
+    if (g_have_device_info_tail)
+        memcpy(pkt + 108, g_device_info_tail, sizeof(g_device_info_tail));
+    put_be32(pkt + 116, 0xffffe3e0);
     memcpy(pkt + 16, mac, 6);
     memcpy(pkt + 44, &local_ip, 4);
     if (g_pairing_key) {
@@ -476,10 +682,36 @@ static int try_handshake(uint32_t scanner_ip, uint32_t local_ip, const uint8_t m
         if (klen > 16) klen = 16;
         memcpy(pkt + 52, g_pairing_key, klen);
     }
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    uint16_t year = (uint16_t)(tm_now.tm_year + 1900);
+    pkt[100] = (uint8_t)(year >> 8);
+    pkt[101] = (uint8_t)(year & 0xff);
+    pkt[102] = (uint8_t)(tm_now.tm_mon + 1);
+    pkt[103] = (uint8_t)tm_now.tm_mday;
+    pkt[104] = (uint8_t)tm_now.tm_hour;
+    pkt[105] = (uint8_t)tm_now.tm_min;
+    pkt[106] = (uint8_t)tm_now.tm_sec;
+    pkt[107] = 0;
+    if (apply_handshake_patches(pkt, sizeof(pkt)) < 0) {
+        if (g_debug) fprintf(stderr, "  invalid handshake patch range\n");
+        close(fd);
+        return -999;
+    }
+    dump_packet_hex("handshake_request", pkt, sizeof(pkt));
 
-    if (write_all(fd, pkt, 128) < 0) { close(fd); return -999; }
+    if (write_all(fd, pkt, 128) < 0) {
+        if (g_debug) perror("  write handshake");
+        close(fd);
+        return -999;
+    }
     uint8_t resp[256];
     ssize_t n = read(fd, resp, sizeof(resp));
+    if (n < 0 && g_debug) perror("  read handshake response");
+    if (n >= 0 && n < 12 && g_debug)
+        fprintf(stderr, "  short handshake response: %zd bytes\n", n);
+    if (n > 0) dump_packet_hex("handshake_response", resp, (size_t)n);
     int32_t err = (n >= 12) ? (int32_t)get_be32(resp + 8) : -999;
     if (g_debug) fprintf(stderr, "  handshake result: %d\n", err);
     shutdown(fd, SHUT_RDWR);
@@ -490,15 +722,27 @@ static int try_handshake(uint32_t scanner_ip, uint32_t local_ip, const uint8_t m
 static int do_handshake_conn1(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6]) {
     if (g_debug) fprintf(stderr, "TCP:53219 handshake...\n");
     int32_t err = try_handshake(scanner_ip, local_ip, mac);
-    if (err == -4) {
-        fprintf(stderr, "Stale session, releasing...\n");
+
+    /*
+     * The original ScanSnap Home client tolerates a transient busy state by
+     * retrying the registration handshake several times. Some scanners keep
+     * returning -4 briefly even after a D6 release, so a single retry is too
+     * brittle.
+     */
+    for (int attempt = 1; err == -4 && attempt <= 8; attempt++) {
+        fprintf(stderr, "Stale session, releasing and retrying (%d/8)...\n", attempt);
         send_d6_release(scanner_ip, mac);
         sleep(1);
-        do_register(scanner_ip, local_ip, mac);
+        if (do_register(scanner_ip, local_ip, mac) < 0)
+            return -1;
         err = try_handshake(scanner_ip, local_ip, mac);
     }
+
     if (err != 0) {
-        fprintf(stderr, "Error: scanner rejected registration (error %d)\n", err);
+        if (err == -999)
+            fprintf(stderr, "Error: TCP handshake to scanner failed (error %d)\n", err);
+        else
+            fprintf(stderr, "Error: scanner rejected registration (error %d)\n", err);
         return -1;
     }
     return 0;
@@ -546,8 +790,9 @@ static int do_init_session(uint32_t scanner_ip, const uint8_t mac[6]) {
     uint8_t hello[16];
     if (read_exact(fd, hello, 16) < 0) { close(fd); return -1; }
 
-    bool t2_ok;
-    pthread_t t2 = start_handshake(scanner_ip, mac, 2, &t2_ok);
+    bool t2_ok = false;
+    pthread_t t2 = (pthread_t){0};
+    t2 = start_handshake(scanner_ip, mac, 2, &t2_ok);
 
     static const char *cmds[] = {
         "0000000600000060000000000000000012000000600000000000000000000000",
@@ -561,7 +806,7 @@ static int do_init_session(uint32_t scanner_ip, const uint8_t mac[6]) {
     static const char *labels[] = { "06+12", "E7", "C2", "E6a", "E6b", "D5", "D6" };
 
     bool t3_ok = false;
-    pthread_t t3;
+    pthread_t t3 = (pthread_t){0};
     for (int i = 0; i < 7; i++) {
         if (g_interrupted) { close(fd); return -1; }
         uint8_t pkt[512];
@@ -723,9 +968,15 @@ static int do_scan(uint32_t scanner_ip, const uint8_t mac[6],
         return -1;
     }
 
-    static const uint8_t ffd8[2] = {0xFF, 0xD8};
-    if (n >= 16 && find_bytes(initial, (size_t)n, ffd8, 2) < 0) {
-        int32_t ec = (n >= 12) ? (int32_t)get_be32(initial + 8) : -999;
+    /*
+     * The scanner may split the image response across TCP packets. In the
+     * captures from this iX500, the first read can contain only the 42-byte
+     * VENS/image header and the JPEG SOI follows in the next segment. Only
+     * treat an initial VENS packet as an error when its status field is
+     * non-zero; otherwise pass it to recv_jpeg() as prepend data.
+     */
+    if (n >= 12 && memcmp(initial + 4, "VENS", 4) == 0 && get_be32(initial + 8) != 0) {
+        int32_t ec = (int32_t)get_be32(initial + 8);
         do_cleanup(fd, scanner_ip, mac);
         fprintf(stderr, "Error: scanner error %d — is there paper in the feeder?\n", ec);
         return -1;
@@ -899,7 +1150,24 @@ static void cleanup_on_exit(void) {
 
 /* ── Get pairing key (fake scanner mode) ─────────────────────────────── */
 
-static int do_getkey(void) {
+static void copy_padded_ascii(uint8_t *dst, size_t dst_len, const char *src) {
+    memset(dst, 0, dst_len);
+    if (!src) return;
+    size_t n = strlen(src);
+    if (n > dst_len) n = dst_len;
+    memcpy(dst, src, n);
+}
+
+static int parse_hex_exact(const char *hex, uint8_t *out, size_t len) {
+    if (!hex) return -1;
+    size_t hex_len = strlen(hex);
+    if (hex_len != len * 2) return -1;
+    return hex_decode(hex, out, len) == (int)len ? 0 : -1;
+}
+
+static int do_getkey(const char *advertise_ip, const char *device_name,
+                     const char *model_name, const char *fake_mac_str,
+                     const char *info_tail_hex) {
     /* Broadcast discovery on UDP:53220 so ScanSnap Home finds us */
     int bcast_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (bcast_fd < 0) { perror("socket"); return -1; }
@@ -907,16 +1175,58 @@ static int do_getkey(void) {
     setsockopt(bcast_fd, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
     setsockopt(bcast_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    /* Get our local IP */
-    int probe = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in pdst = { .sin_family = AF_INET, .sin_port = htons(1) };
-    inet_pton(AF_INET, "8.8.8.8", &pdst.sin_addr);
-    connect(probe, (struct sockaddr *)&pdst, sizeof(pdst));
-    struct sockaddr_in plocal;
-    socklen_t pslen = sizeof(plocal);
-    getsockname(probe, (struct sockaddr *)&plocal, &pslen);
-    close(probe);
+    /* Get or override our local IP */
+    struct sockaddr_in plocal = { .sin_family = AF_INET };
+    if (advertise_ip && advertise_ip[0]) {
+        if (inet_pton(AF_INET, advertise_ip, &plocal.sin_addr) != 1) {
+            fprintf(stderr, "Error: invalid --getkey-ip address: %s\n", advertise_ip);
+            close(bcast_fd);
+            return -1;
+        }
+    } else {
+        int probe = socket(AF_INET, SOCK_DGRAM, 0);
+        if (probe < 0) { close(bcast_fd); return -1; }
+        struct sockaddr_in pdst = { .sin_family = AF_INET, .sin_port = htons(1) };
+        inet_pton(AF_INET, "8.8.8.8", &pdst.sin_addr);
+        connect(probe, (struct sockaddr *)&pdst, sizeof(pdst));
+        socklen_t pslen = sizeof(plocal);
+        getsockname(probe, (struct sockaddr *)&plocal, &pslen);
+        close(probe);
+    }
     uint8_t *ip = (uint8_t *)&plocal.sin_addr.s_addr;
+    uint8_t fake_mac[6] = {0x00, 0x80, 0x92, 0x58, 0xc1, 0x5c};
+    uint8_t info_tail[8] = {0x36, 0xc7, 0xc7, 0xe4, 0x7a, 0x80, 0x00, 0x00};
+    if (fake_mac_str && fake_mac_str[0]) {
+        if (parse_mac_address(fake_mac_str, fake_mac) < 0) {
+            fprintf(stderr, "Error: invalid --getkey-mac address: %s\n", fake_mac_str);
+            close(bcast_fd);
+            return -1;
+        }
+    }
+    if (info_tail_hex && info_tail_hex[0]) {
+        if (parse_hex_exact(info_tail_hex, info_tail, sizeof(info_tail)) < 0) {
+            fprintf(stderr, "Error: invalid --getkey-tail value: %s\n", info_tail_hex);
+            close(bcast_fd);
+            return -1;
+        }
+    }
+    if (g_debug) {
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &plocal.sin_addr, ip_str, sizeof(ip_str));
+        fprintf(stderr, "Fake scanner advertising IP %s\n", ip_str);
+        fprintf(stderr, "Fake scanner name '%s'\n",
+                device_name ? device_name : "iX500-A0PB023744");
+        fprintf(stderr, "Fake scanner model '%s'\n",
+                model_name ? model_name : "ScanSnap iX500");
+        fprintf(stderr, "Fake scanner MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                fake_mac[0], fake_mac[1], fake_mac[2],
+                fake_mac[3], fake_mac[4], fake_mac[5]);
+        fprintf(stderr, "Fake scanner UDP info tail %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                info_tail[0], info_tail[1], info_tail[2], info_tail[3],
+                info_tail[4], info_tail[5], info_tail[6], info_tail[7]);
+        fprintf(stderr, "Listening on UDP 52217, TCP 53219, TCP 53218\n");
+        fprintf(stderr, "Broadcasting discovery on UDP 53220\n");
+    }
 
     /* Listen on UDP:52217 for registration */
     int reg_fd = bind_udp(52217);
@@ -951,16 +1261,15 @@ static int do_getkey(void) {
         }
     }
 
-    /* Build discovery broadcast packet (48 bytes) */
+    /* Build discovery broadcast packet (48 bytes).
+     * Real scanner packets place 0x01 at byte 16 and the IP at byte 20. */
     uint8_t disc[48] = {0};
     put_be32(disc, 48);
     memcpy(disc + 4, "VENS", 4);
     put_be32(disc + 8, 0x21);
-    put_be32(disc + 16, 1);
-    memcpy(disc + 24, ip, 4);
-    /* Silex MAC prefix so ScanSnap Home recognizes us */
-    uint8_t silex_mac[] = {0x00, 0x80, 0x92, 0x58, 0xc1, 0x5c};
-    memcpy(disc + 28, silex_mac, 6);
+    disc[16] = 1;
+    memcpy(disc + 20, ip, 4);
+    memcpy(disc + 24, fake_mac, 6);
 
     /* Real scanner registration response (132 bytes) */
     uint8_t reg_resp[132];
@@ -976,6 +1285,12 @@ static int do_getkey(void) {
         "7a800000",
         reg_resp, sizeof(reg_resp));
     memcpy(reg_resp + 16, ip, 4);  /* our IP */
+    memcpy(reg_resp + 28, fake_mac, 6);
+    copy_padded_ascii(reg_resp + 40, 16,
+                      device_name ? device_name : "iX500-A0PB023744");
+    copy_padded_ascii(reg_resp + 104, 16,
+                      model_name ? model_name : "ScanSnap iX500  ");
+    memcpy(reg_resp + 124, info_tail, sizeof(info_tail));
 
     struct sockaddr_in bcast_dst = {
         .sin_family = AF_INET, .sin_port = htons(53220),
@@ -1001,8 +1316,9 @@ static int do_getkey(void) {
         /* Broadcast every 2 seconds */
         time_t now = time(NULL);
         if (now - last_bcast >= 2) {
-            sendto(bcast_fd, disc, 48, 0,
-                   (struct sockaddr *)&bcast_dst, sizeof(bcast_dst));
+            ssize_t sent = sendto(bcast_fd, disc, 48, 0,
+                                  (struct sockaddr *)&bcast_dst, sizeof(bcast_dst));
+            if (g_debug && sent < 0) perror("broadcast 53220");
             last_bcast = now;
         }
 
@@ -1017,6 +1333,9 @@ static int do_getkey(void) {
             ssize_t n = recvfrom(reg_fd, buf, sizeof(buf), 0,
                                  (struct sockaddr *)&from, &flen);
             if (n > 0) {
+                if (g_debug)
+                    fprintf(stderr, "UDP registration from %s (%zd bytes)\n",
+                            inet_ntoa(from.sin_addr), n);
                 sendto(reg_fd, reg_resp, 132, 0,
                        (struct sockaddr *)&from, flen);
             }
@@ -1028,6 +1347,8 @@ static int do_getkey(void) {
             socklen_t clen = sizeof(client);
             int conn = accept(tcp_fd, (struct sockaddr *)&client, &clen);
             if (conn < 0) continue;
+            if (g_debug)
+                fprintf(stderr, "TCP 53219 from %s\n", inet_ntoa(client.sin_addr));
             set_timeout(conn, 5);
 
             /* Send 16-byte hello */
@@ -1058,12 +1379,15 @@ static int do_getkey(void) {
                     memcpy(resp + 4, "VENS", 4);
                     write_all(conn, resp, 20);
                 } else if (cmd == 0x13) {
+                    if (g_debug) fprintf(stderr, "Handshake command 0x13\n");
                     uint8_t resp[112] = {0};
                     put_be32(resp, 112);
                     memcpy(resp + 4, "VENS", 4);
-                    memcpy(resp + 16, "iX500-A0PB023744", 16);
+                    copy_padded_ascii(resp + 16, 16,
+                                      device_name ? device_name : "iX500-A0PB023744");
                     write_all(conn, resp, 112);
                 } else if (cmd == 0x30) {
+                    if (g_debug) fprintf(stderr, "Handshake command 0x30\n");
                     uint8_t resp[32] = {0};
                     put_be32(resp, 32);
                     memcpy(resp + 4, "VENS", 4);
@@ -1077,6 +1401,7 @@ static int do_getkey(void) {
         if (fds[2].revents & POLLIN) {
             int conn = accept(scan_fd, NULL, NULL);
             if (conn >= 0) {
+                if (g_debug) fprintf(stderr, "TCP 53218 probe accepted\n");
                 uint8_t hello[16] = {0};
                 put_be32(hello, 16);
                 memcpy(hello + 4, "VENS", 4);
@@ -1103,7 +1428,25 @@ static void usage(void) {
         "  -1       single-sided (discard back pages)\n"
         "  -d       debug output\n"
         "  -h       help\n"
-        "  --getkey capture pairing key from ScanSnap Home\n");
+        "  --getkey capture pairing key from ScanSnap Home\n"
+        "  --getkey-ip IP\n"
+        "           advertise this host IP in fake scanner mode\n"
+        "  --getkey-name NAME\n"
+        "           fake scanner device name (default: iX500-A0PB023744)\n"
+        "  --getkey-model MODEL\n"
+        "           fake scanner model string (default: ScanSnap iX500)\n"
+        "  --getkey-mac MAC\n"
+        "           fake scanner MAC (default: 00:80:92:58:c1:5c)\n"
+        "  --getkey-tail HEX\n"
+        "           8-byte hex tail for UDP device info response\n"
+        "  --client-ip IP\n"
+        "           override local client IP for scanner communication\n"
+        "  --client-mac MAC\n"
+        "           override client MAC for scanner communication\n"
+        "  --dump-handshake FILE\n"
+        "           append TCP 0x11 request/response hex to FILE\n"
+        "  --handshake-patch OFFSET:HEX\n"
+        "           patch bytes in TCP 0x11 request before sending\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -1112,11 +1455,140 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, on_signal);
     atexit(cleanup_on_exit);
 
-    /* Check for --getkey before getopt */
+    /* Check for --getkey before getopt so it can run standalone */
+    bool want_getkey = false;
+    const char *getkey_ip = NULL;
+    const char *getkey_name = NULL;
+    const char *getkey_model = NULL;
+    const char *getkey_mac = NULL;
+    const char *getkey_tail = NULL;
+    const char *client_ip = NULL;
+    const char *client_mac = NULL;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--getkey") == 0)
-            return do_getkey() < 0 ? 1 : 0;
+        if (strcmp(argv[i], "--getkey") == 0) {
+            want_getkey = true;
+        } else if (strcmp(argv[i], "-d") == 0) {
+            g_debug = true;
+        } else if (strcmp(argv[i], "--getkey-ip") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --getkey-ip requires an IP address\n");
+                return 1;
+            }
+            getkey_ip = argv[++i];
+        } else if (strncmp(argv[i], "--getkey-ip=", 12) == 0) {
+            getkey_ip = argv[i] + 12;
+        } else if (strcmp(argv[i], "--getkey-name") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --getkey-name requires a value\n");
+                return 1;
+            }
+            getkey_name = argv[++i];
+        } else if (strncmp(argv[i], "--getkey-name=", 14) == 0) {
+            getkey_name = argv[i] + 14;
+        } else if (strcmp(argv[i], "--getkey-model") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --getkey-model requires a value\n");
+                return 1;
+            }
+            getkey_model = argv[++i];
+        } else if (strncmp(argv[i], "--getkey-model=", 15) == 0) {
+            getkey_model = argv[i] + 15;
+        } else if (strcmp(argv[i], "--getkey-mac") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --getkey-mac requires a value\n");
+                return 1;
+            }
+            getkey_mac = argv[++i];
+        } else if (strncmp(argv[i], "--getkey-mac=", 13) == 0) {
+            getkey_mac = argv[i] + 13;
+        } else if (strcmp(argv[i], "--getkey-tail") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --getkey-tail requires a value\n");
+                return 1;
+            }
+            getkey_tail = argv[++i];
+        } else if (strncmp(argv[i], "--getkey-tail=", 14) == 0) {
+            getkey_tail = argv[i] + 14;
+        } else if (strcmp(argv[i], "--client-ip") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --client-ip requires an IP address\n");
+                return 1;
+            }
+            client_ip = argv[++i];
+        } else if (strncmp(argv[i], "--client-ip=", 12) == 0) {
+            client_ip = argv[i] + 12;
+        } else if (strcmp(argv[i], "--client-mac") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --client-mac requires a value\n");
+                return 1;
+            }
+            client_mac = argv[++i];
+        } else if (strncmp(argv[i], "--client-mac=", 13) == 0) {
+            client_mac = argv[i] + 13;
+        } else if (strcmp(argv[i], "--dump-handshake") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --dump-handshake requires a path\n");
+                return 1;
+            }
+            g_handshake_dump_path = argv[++i];
+        } else if (strncmp(argv[i], "--dump-handshake=", 17) == 0) {
+            g_handshake_dump_path = argv[i] + 17;
+        } else if (strcmp(argv[i], "--handshake-patch") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --handshake-patch requires OFFSET:HEX\n");
+                return 1;
+            }
+            if (add_handshake_patch(argv[++i]) < 0) {
+                fprintf(stderr, "Error: invalid --handshake-patch value\n");
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--handshake-patch=", 18) == 0) {
+            if (add_handshake_patch(argv[i] + 18) < 0) {
+                fprintf(stderr, "Error: invalid --handshake-patch value\n");
+                return 1;
+            }
+        }
     }
+    if (want_getkey) {
+        return do_getkey(getkey_ip, getkey_name, getkey_model,
+                         getkey_mac, getkey_tail) < 0 ? 1 : 0;
+    }
+
+    int filtered_argc = 1;
+    for (int i = 1; i < argc; i++) {
+        bool skip_current = false;
+        bool skip_next = false;
+        if (strcmp(argv[i], "--getkey") == 0) {
+            skip_current = true;
+        } else if (strcmp(argv[i], "--getkey-ip") == 0
+                   || strcmp(argv[i], "--getkey-name") == 0
+                   || strcmp(argv[i], "--getkey-model") == 0
+                   || strcmp(argv[i], "--getkey-mac") == 0
+                   || strcmp(argv[i], "--getkey-tail") == 0
+                   || strcmp(argv[i], "--client-ip") == 0
+                   || strcmp(argv[i], "--client-mac") == 0
+                   || strcmp(argv[i], "--dump-handshake") == 0
+                   || strcmp(argv[i], "--handshake-patch") == 0) {
+            skip_current = true;
+            skip_next = true;
+        } else if (strncmp(argv[i], "--getkey-ip=", 12) == 0
+                   || strncmp(argv[i], "--getkey-name=", 14) == 0
+                   || strncmp(argv[i], "--getkey-model=", 15) == 0
+                   || strncmp(argv[i], "--getkey-mac=", 13) == 0
+                   || strncmp(argv[i], "--getkey-tail=", 14) == 0
+                   || strncmp(argv[i], "--client-ip=", 12) == 0
+                   || strncmp(argv[i], "--client-mac=", 13) == 0
+                   || strncmp(argv[i], "--dump-handshake=", 17) == 0
+                   || strncmp(argv[i], "--handshake-patch=", 18) == 0) {
+            skip_current = true;
+        }
+
+        if (!skip_current)
+            argv[filtered_argc++] = argv[i];
+        if (skip_next) i++;
+    }
+    argc = filtered_argc;
+    argv[argc] = NULL;
 
     const char *scanner_str = NULL, *output = NULL, *key_str = NULL;
     bool jpeg_mode = false, simplex = false;
@@ -1157,7 +1629,7 @@ int main(int argc, char *argv[]) {
 
     uint8_t mac[6];
     uint32_t local_ip;
-    if (detect_network(scanner_ip, mac, &local_ip) < 0) {
+    if (detect_network(scanner_ip, mac, &local_ip, client_ip, client_mac) < 0) {
         fprintf(stderr, "Error: failed to detect network\n");
         return 1;
     }
@@ -1168,6 +1640,7 @@ int main(int argc, char *argv[]) {
     }
 
     g_scanner_ip = scanner_ip;
+    g_bind_ip = local_ip;
     memcpy(g_mac, mac, 6);
 
     if (do_register(scanner_ip, local_ip, mac) < 0

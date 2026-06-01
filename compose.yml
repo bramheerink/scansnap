@@ -1,0 +1,13 @@
+name: scansnap
+
+services:
+  scansnap:
+    build:
+      context: .
+    image: scansnap:local
+    working_dir: /work
+    volumes:
+      - ./output:/work
+      - ./config:/config
+    network_mode: host
+    command: ["-h"]

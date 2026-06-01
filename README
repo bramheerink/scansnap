@@ -12,6 +12,130 @@ BUILD
 
           make
 
+DOCKER
+
+          Build:
+
+              docker build -t scansnap .
+
+          Show help:
+
+              docker run --rm scansnap
+
+          Scan to the current directory using a saved key:
+
+              docker run --rm \
+                -v "$PWD:/work" \
+                -v "$HOME/.config:/config" \
+                scansnap -s SCANNER_IP
+
+          Notes:
+
+          - The container includes the `ip` command because the tool
+            uses `ip route get` internally to pick the correct
+            interface.
+          - Auto-discovery works best with host networking. On Linux,
+            use `--network host`. On Docker Desktop, passing `-s IP`
+            is usually the safer option.
+          - `--getkey` needs the ScanSnap Home app to reach the fake
+            scanner ports. That generally means `--network host`, or
+            equivalent host-network support in your Docker runtime.
+
+QUICK START WITH DOCKER ON LINUX
+
+          On Linux, run the container with host networking so the
+     scanner sees the real host IP and MAC address:
+
+              mkdir -p output config/scansnap
+              printf 'YOUR_PAIRING_KEY\n' > config/scansnap/key
+              chmod 600 config/scansnap/key
+
+              docker build -t scansnap .
+              docker run --rm \
+                --network host \
+                -v "$PWD/output:/work" \
+                -v "$PWD/config:/config" \
+                scansnap -d -s SCANNER_IP -o /work/scan.pdf
+
+          Scanned files are written to `./output` on the host. Keep
+     ScanSnap Home stopped while using the container.
+
+DOCKER COMPOSE WORKFLOW
+
+          The compose setup is meant for a Linux host on the same LAN
+     as the scanner. It persists two directories in the repository:
+
+          - `./output` for scanned PDFs/JPEGs
+          - `./config` for the saved pairing key
+
+          Prepare the folders and build once:
+
+              mkdir -p output config
+              docker compose build
+
+          One-time pairing key bootstrap:
+
+          1. Turn off or disconnect the real scanner
+          2. Start the fake scanner:
+
+                 docker compose run --rm scansnap --getkey
+
+          3. Open ScanSnap Home on your Mac or Windows machine
+          4. Wait for the key to be printed and saved to:
+
+                 ./config/scansnap/key
+
+          Regular scans with the saved key:
+
+              docker compose run --rm scansnap -s SCANNER_IP
+
+          The PDF is written to `./output` because `/work` is bound to
+     that folder inside the container. If you already know the pairing
+     key, you can skip the bootstrap step and either put it in
+     `./config/scansnap/key` or pass `-k KEY` manually.
+
+          Stop ScanSnap Home before regular scans. Its background
+     helpers keep registering with the scanner and can hold the device
+     in a busy session state, which shows up as handshake error -4.
+
+          Important:
+
+          - The compose file uses `network_mode: host` because the
+            protocol setup needs the scanner to see the host IP and,
+            for `--getkey`, to reach ports 52217, 53218 and 53219.
+          - This is reliable on Linux. Docker Desktop on macOS/Windows
+            can still build the image, but runtime communication with
+            the physical scanner may fail because host networking is
+            not equivalent there.
+          - For custom output names, append normal CLI flags:
+
+                docker compose run --rm scansnap -s SCANNER_IP -o /work/my_scan.pdf
+          - If `--getkey` sees no traffic on a multi-homed host, run
+            it in debug mode and force the advertised host IP:
+
+                docker compose run --rm scansnap -d --getkey --getkey-ip HOST_LAN_IP
+          - If ScanSnap Home keeps sending UDP registrations but never
+            opens TCP 53219, match the fake scanner identity more
+            closely to the real device:
+
+                docker compose run --rm scansnap \
+                  -d --getkey \
+                  --getkey-ip HOST_LAN_IP \
+                  --getkey-name 'iX500-XXXXXXXXXX' \
+                  --getkey-model 'ScanSnap iX500' \
+                  --getkey-mac 'SCANNER_MAC' \
+                  --getkey-tail 'TAIL_HEX_FROM_CAPTURE'
+          - For firmware-specific debugging, dump the live TCP `0x11`
+            handshake request/response and patch individual bytes:
+
+                ./scansnap -d -s SCANNER_IP -k KEY \
+                  --dump-handshake handshake.log \
+                  --handshake-patch OFFSET:HEX_BYTES
+
+          - Compare the first TCP `0x11` request across captures:
+
+                python3 scripts/compare_handshakes.py try-to-get-key.pcapng try-to-get-key4.pcapng
+
 
 SETUP (one time)
 
@@ -36,6 +160,55 @@ SCAN
           The scanner is found automatically on your local network.
      Pages come out as a timestamped PDF in the current directory.
 
+          If ScanSnap Home is installed on the same machine, quit it
+     completely before scanning. On macOS the menu bar app leaves helper
+     processes running; stop them before using this tool:
+
+          pkill -f '/Applications/ScanSnapHomeMain.app'
+
+          Error -4 means the scanner still has a busy/stale session.
+     Turn the scanner off and on, make sure ScanSnap Home is not
+     running, then retry.
+
+
+KNOWN LIMITATIONS
+
+          This v0.1 release supports active scans: the command starts
+     the scan and writes PDF/JPEG output. A physical scanner-button
+     daemon mode is not implemented yet.
+
+          The scanner only supports one active client session. If
+     ScanSnap Home or one of its background helpers is running, the
+     scanner may reject this tool with error -4. Stop ScanSnap Home
+     and restart the scanner if the stale session does not clear.
+
+          Docker Desktop networking on macOS/Windows is not equivalent
+     to Linux host networking. For reliable scanner access, run the
+     container on a Linux host in the same LAN as the scanner.
+
+
+SECURITY AND PRIVACY
+
+          Treat the pairing key as a secret. It authorizes a client to
+     talk to the scanner.
+
+          Packet captures and debug handshake logs can contain pairing
+     keys, MAC addresses, IP addresses and scanned image data. Do not
+     publish them.
+
+
+BUTTON DAEMON ROADMAP
+
+          The current captures suggest that ScanSnap Home keeps or
+     prepares a scanner session and then scans from that state when the
+     physical scanner button is pressed. They do not prove a simple
+     scanner-initiated callback that a passive client can wait for.
+
+          A future daemon mode should own the scanner session, keep
+     ScanSnap Home stopped, monitor scanner state, and write timestamped
+     PDFs when a button-triggered scan is detected. See
+     `docs/button-daemon-roadmap.md` for the proposed follow-up spec.
+
 
 OPTIONS
 
@@ -46,6 +219,24 @@ OPTIONS
      -1          single-sided (discard back pages)
      -d          debug output
      --getkey    capture pairing key (see setup)
+     --getkey-ip IP
+                 advertise this host IP in fake scanner mode
+     --getkey-name NAME
+                 fake scanner device name for `--getkey`
+     --getkey-model MODEL
+                 fake scanner model string for `--getkey`
+     --getkey-mac MAC
+                 fake scanner MAC for `--getkey`
+     --getkey-tail HEX
+                 8-byte hex tail for the UDP device info response
+     --client-ip IP
+                 override local client IP for scanner communication
+     --client-mac MAC
+                 override client MAC for scanner communication
+     --dump-handshake FILE
+                 append TCP 0x11 request/response hex to FILE
+     --handshake-patch OFFSET:HEX
+                 patch bytes in the TCP 0x11 request before sending
 
 
 HOW IT WORKS
