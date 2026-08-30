@@ -3,7 +3,7 @@ name: scansnap
 services:
   scansnap:
     build:
-      context: .
+      context: ./legacy
     image: scansnap:local
     working_dir: /work
     volumes:

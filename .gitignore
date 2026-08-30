@@ -7,3 +7,6 @@ scansnap
 handshake*.log
 config/
 output/
+__pycache__/
+*.pyc
+scans/

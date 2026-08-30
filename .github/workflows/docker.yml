@@ -44,7 +44,7 @@ jobs:
       - name: Build image for smoke test
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./legacy
           load: true
           tags: scansnap-ci:latest
           cache-from: type=gha
@@ -65,7 +65,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./legacy
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
