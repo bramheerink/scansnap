@@ -227,6 +227,25 @@ SCAN SESSION (TCP PORT 53218)
           The connection is closed after the D6 release. This
      prepares the scanner for a new scan session.
 
+     Device Status (0xC2)
+
+          The 0xC2 query returns the scanner status inside a normal
+     VENS response (72 bytes total on an iX500). It must be issued
+     within an open session (after the 53219 handshake); on a bare
+     53218 connection the scanner accepts only 0xD6.
+
+          Byte 43 of the response is a feeder/tray flag:
+
+       C2[43] & 0x80 == 0x80   tray is EMPTY
+       C2[43] & 0x80 == 0x00   paper is present
+
+          This lets a client check for paper before starting a scan
+     rather than relying on the feeder-empty error at scan start (see
+     ERROR RECOVERY). The physical "paper loaded" LED on the scanner
+     tracks the same sensor. Calibrated by diffing the C2 response
+     with and without paper in the tray on an iX500; the byte offset
+     may differ on other models.
+
      Scan Sequence
 
           A second TCP:53218 connection is used for the actual scan:
