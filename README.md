@@ -53,7 +53,7 @@ module. ScanSnap Home knows this key, so we trick it into telling us:
 
 1. Turn the **real scanner off** (or disconnect it).
 2. Run `python3 scansnap.py pair --name iX500-<YOUR-SERIAL>` (the serial is
-   printed on the label on the bottom of the scanner). Ports 52217/53218/53219
+   printed on the label on the bottom of the scanner). Ports 52217, 53218, 53219
    must be free — you may need `sudo` if something else is bound to them.
 3. Open **ScanSnap Home** on your Mac or Windows machine. It finds the fake
    scanner and sends the pairing key, which is saved to `~/.config/scansnap/key`.
