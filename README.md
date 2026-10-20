@@ -12,7 +12,6 @@ The scanner speaks a proprietary protocol ("VENS") over UDP and TCP. See
 ## Requirements
 
 - Python 3.8+ (standard library only — **no pip install needed**)
-- `iproute2` (`ip` command, present on every Linux)
 
 ## Quick start
 

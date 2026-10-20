@@ -15,7 +15,7 @@ Speaks the reverse-engineered VENS protocol. One tool for everything:
 Ports: 52217/udp register  53220/udp discovery  53218/tcp scan  53219/tcp handshake
 Pairing key is read from / written to ~/.config/scansnap/key.
 """
-import argparse, os, re, socket, struct, subprocess, sys, threading, time, ipaddress
+import argparse, ctypes, ctypes.util, os, re, socket, struct, sys, threading, time, ipaddress
 
 REG_PORT, DISC_PORT, SCAN_PORT, HS_PORT = 52217, 53220, 53218, 53219
 CLIENT_UDP_PORT = 55264
@@ -47,12 +47,51 @@ def local_ip_toward(ip):
     finally:
         s.close()
 
+class _IfAddrs(ctypes.Structure):
+    pass
+_IfAddrs._fields_ = [("next", ctypes.POINTER(_IfAddrs)), ("name", ctypes.c_char_p),
+                     ("flags", ctypes.c_uint), ("addr", ctypes.c_void_p)]
+
+def _interfaces():
+    """Yield (ifname, family, raw sockaddr bytes) for every getifaddrs() entry."""
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    head = ctypes.POINTER(_IfAddrs)()
+    if libc.getifaddrs(ctypes.byref(head)) != 0:
+        raise OSError(ctypes.get_errno(), "getifaddrs failed")
+    try:
+        ifa = head
+        while ifa:
+            e = ifa.contents
+            if e.addr:
+                # BSD/macOS sockaddr: [len, family]; Linux: u16 family (native order)
+                if sys.platform == "linux":
+                    fam = ctypes.c_uint16.from_address(e.addr).value
+                    size = 20 if fam == socket.AF_PACKET else 16
+                else:
+                    sa_len = ctypes.c_uint8.from_address(e.addr).value
+                    fam = ctypes.c_uint8.from_address(e.addr + 1).value
+                    size = sa_len
+                yield e.name.decode(), fam, ctypes.string_at(e.addr, size)
+            ifa = e.next
+    finally:
+        libc.freeifaddrs(head)
+
 def wifi_mac_toward(ip):
-    out = subprocess.check_output(["ip", "route", "get", ip]).decode()
-    iface = re.search(r'dev (\S+)', out).group(1)
-    out2 = subprocess.check_output(["ip", "link", "show", iface]).decode()
-    mac = re.search(r'link/ether ([0-9a-f:]+)', out2).group(1)
-    return bytes.fromhex(mac.replace(":", "")), mac
+    local = socket.inet_aton(local_ip_toward(ip))
+    entries = list(_interfaces())
+    iface = next(n for n, fam, sa in entries
+                 if fam == socket.AF_INET and sa[4:8] == local)
+    for n, fam, sa in entries:
+        if n != iface:
+            continue
+        if sys.platform == "linux" and fam == socket.AF_PACKET:
+            raw = sa[12:18]            # sockaddr_ll.sll_addr
+        elif sys.platform != "linux" and fam == 18:  # AF_LINK, sockaddr_dl
+            raw = sa[8 + sa[5]:8 + sa[5] + 6]  # skip sdl_nlen name bytes
+        else:
+            continue
+        return raw, raw.hex(":")
+    raise OSError(f"no MAC address found for interface {iface}")
 
 def tcp_open(ip, port, timeout=0.5):
     s = socket.socket(); s.settimeout(timeout)
