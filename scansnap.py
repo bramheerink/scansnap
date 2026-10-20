@@ -8,35 +8,35 @@ Speaks the reverse-engineered VENS protocol. One tool for everything:
   scansnap status  <IP>             session state + paper check
   scansnap paper   <IP>             is there paper in the tray?
   scansnap scan    [-s IP] [-o f]   scan all sheets -> PDF (or --jpeg)
-  scansnap pair                     capture the pairing key (fake-scanner trick)
   scansnap release <IP>             force-clear a stuck session lock
   scansnap listen                   watch for scanner 53220 broadcasts
 
 Ports: 52217/udp register  53220/udp discovery  53218/tcp scan  53219/tcp handshake
-Pairing key is read from / written to ~/.config/scansnap/key.
+Commands that talk to the scanner take -p/--password (or $SCANSNAP_PASSWORD).
 """
 import argparse, os, re, socket, struct, subprocess, sys, threading, time, ipaddress
 
 REG_PORT, DISC_PORT, SCAN_PORT, HS_PORT = 52217, 53220, 53218, 53219
 CLIENT_UDP_PORT = 55264
-SILEX_MAC = bytes.fromhex("00809258c15c")
-KEY_PATH = os.path.expanduser("~/.config/scansnap/key")
-VENS_HELLO = bytes.fromhex("0000001056454e530000000000000000")
 
-# ── pairing key storage ─────────────────────────────────────────────────────
+# ── password ─────────────────────────────────────────────────────────────────
 
-def load_key():
+# The scanner's "key" is the ScanSnap password (4 digits by default, printed on the
+# scanner). The vendor client sends it as 3-digit decimals, c + mask[i] + 11 per
+# character (PfuSsNetIF::ReserveScanner), so no pairing step is needed.
+PW_MASK = b"pFusCANsNapFiPfu"
+
+def encode_password(password: str) -> bytes:
+    pw = password.encode()
+    if not 1 <= len(pw) <= 16:
+        raise ValueError("password must be 1-16 characters")
+    return b"".join(b"%03d" % (c + PW_MASK[i] + 11) for i, c in enumerate(pw))
+
+def password_arg(value):
     try:
-        with open(KEY_PATH) as f:
-            return f.read().strip().encode()
-    except OSError:
-        return None
-
-def save_key(key: bytes):
-    os.makedirs(os.path.dirname(KEY_PATH), exist_ok=True)
-    with open(KEY_PATH, "w") as f:
-        f.write(key.decode())
-    os.chmod(KEY_PATH, 0o600)
+        return encode_password(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
 
 # ── low-level ────────────────────────────────────────────────────────────────
 
@@ -134,6 +134,10 @@ def register_probe(ip, mac, my_ip, timeout=2.0):
     finally:
         s.close()
 
+# 8 bytes the scanner returns at offset 124 of its 132-byte registration reply; the
+# vendor client echoes them back at offset 108 of the TCP handshake (device-specific).
+DEVINFO_TAIL = None
+
 def register_rounds(ip, mac, my_ip, rounds=4):
     """Full registration burst (4 rounds x 3 magics) like the Mac does."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -155,8 +159,11 @@ def register_rounds(ip, mac, my_ip, rounds=4):
             pkt[22:24] = struct.pack(">H", 0xd7e0)
             pkt[24:26] = struct.pack(">H", flags)
             s.sendto(bytes(pkt), (ip, REG_PORT))
+    global DEVINFO_TAIL
     try:
-        s.recvfrom(512)
+        data, _ = s.recvfrom(512)
+        if len(data) >= 132 and data[:4] == b"VENS" and data[4:8] == b"\x00\x00\x00\x00":
+            DEVINFO_TAIL = data[124:132]
     except socket.timeout:
         pass
     s.close()
@@ -184,8 +191,14 @@ def handshake_code(ip, mac, my_ip, key, timeout=4.0):
         pkt[16:22] = mac
         pkt[44:48] = socket.inet_aton(my_ip)
         if key:
-            pkt[52:68] = b"\x00" * 16
-            pkt[52:52 + len(key[:16])] = key[:16]
+            pkt[52:100] = b"\x00" * 48
+            pkt[52:52 + len(key[:48])] = key[:48]
+        if DEVINFO_TAIL:
+            pkt[108:116] = DEVINFO_TAIL
+        now = time.localtime()
+        pkt[100:108] = struct.pack(">HBBBBBB", now.tm_year, now.tm_mon, now.tm_mday,
+                                   now.tm_hour, now.tm_min, now.tm_sec, 0)
+        pkt[116:120] = struct.pack(">i", -now.tm_gmtoff)  # seconds to add to local time to get UTC
         s.send(bytes(pkt))
         resp = s.recv(256)
         err = struct.unpack(">i", resp[8:12])[0] if len(resp) >= 12 else None
@@ -504,132 +517,6 @@ def _write_pdf(jpegs, path, jpeg_dims):
     with open(path, "wb") as f:
         f.write(buf)
 
-# ── pairing (fake-scanner trick) ──────────────────────────────────────────────
-
-# 132B device-info template. The model/serial field at [40:56] is filled in at
-# runtime from --name so no real serial is baked into the source.
-_REG_TEMPLATE = bytes.fromhex(
-    "56454e530000000000060030ffffffff"   # VENS header
-    "c0a8018c0000cfe20000cfe300809258"   # ip(placeholder) ports mac...
-    "c15c0000008000010000000000000000"   # ...mac end; model[40:48] zeroed
-    "00000000000000000000000000000000"   # model[48:56] zeroed
-    "00000000000000000000000000000000"
-    "00000000000000000000000000000000"
-    "00000000000000005363616e536e6170"   # "ScanSnap" at [104]
-    "20695835303020200000000036c7c7e4"   # " iX500  " + tail start
-    "7a800000")
-
-def build_reg_resp(ip_bytes, mac, name):
-    b = bytearray(_REG_TEMPLATE)
-    b[16:20] = ip_bytes
-    b[28:34] = mac
-    b[40:56] = b"\x00" * 16
-    enc = name.encode()[:16]
-    b[40:40 + len(enc)] = enc
-    return bytes(b)
-
-def cmd_pair(args):
-    """Pretend to be a scanner so ScanSnap Home hands us the pairing key."""
-    my_ip = local_ip_toward("8.8.8.8")
-    ipb = socket.inet_aton(my_ip)
-    reg = bytearray(build_reg_resp(ipb, SILEX_MAC, args.name))
-    print("Nep-scanner actief. Zorg dat:")
-    print("  1. de ECHTE scanner UIT staat")
-    print("  2. ScanSnap Home op je Mac open is (die stuurt dan de key)")
-    print("Wachten op de pairing-key... (Ctrl-C om te stoppen)\n")
-    stop = threading.Event()
-    captured = {}
-
-    def broadcaster():
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        disc = bytearray(48)
-        struct.pack_into(">I", disc, 0, 48); disc[4:8] = b"VENS"
-        struct.pack_into(">I", disc, 8, 0x21); struct.pack_into(">I", disc, 16, 1)
-        disc[24:28] = ipb; disc[28:34] = SILEX_MAC
-        while not stop.is_set():
-            try: s.sendto(bytes(disc), ("255.255.255.255", DISC_PORT))
-            except OSError: pass
-            stop.wait(3)
-        s.close()
-
-    def udp_responder():
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("", REG_PORT)); s.settimeout(1)
-        while not stop.is_set():
-            try:
-                _, addr = s.recvfrom(512)
-                s.sendto(bytes(reg), addr)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-        s.close()
-
-    def hs_listener():
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("", HS_PORT)); s.listen(5); s.settimeout(1)
-        while not stop.is_set():
-            try:
-                conn, addr = s.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            try:
-                conn.settimeout(5)
-                conn.send(VENS_HELLO)
-                data = conn.recv(512)
-                if len(data) >= 68 and struct.unpack(">I", data[0:4])[0] == 128:
-                    key = data[52:68].rstrip(b"\x00")
-                    if key and not captured:
-                        captured["key"] = key
-                        resp = bytearray(20)
-                        struct.pack_into(">I", resp, 0, 20); resp[4:8] = b"VENS"
-                        struct.pack_into(">I", resp, 12, 0x00060000)
-                        conn.send(bytes(resp))
-                        stop.set()
-                conn.close()
-            except OSError:
-                pass
-        s.close()
-
-    def scan_listener():
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("", SCAN_PORT)); s.listen(5); s.settimeout(1)
-        except OSError:
-            return
-        while not stop.is_set():
-            try:
-                conn, _ = s.accept(); conn.send(VENS_HELLO); conn.close()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-        s.close()
-
-    threads = [threading.Thread(target=f, daemon=True)
-               for f in (broadcaster, udp_responder, hs_listener, scan_listener)]
-    for t in threads:
-        t.start()
-    try:
-        while not stop.is_set():
-            time.sleep(0.3)
-    except KeyboardInterrupt:
-        stop.set()
-        print("\nGestopt zonder key.")
-        return 1
-    key = captured.get("key")
-    if key:
-        save_key(key)
-        print(f"✓ Pairing-key opgevangen en opgeslagen: {key.decode()}  ({KEY_PATH})")
-        return 0
-    return 1
-
 # ── CLI commands ──────────────────────────────────────────────────────────────
 
 def _resolve_ip(args):
@@ -674,7 +561,7 @@ def cmd_status(args):
     ip = _resolve_ip(args)
     if not ip: return 1
     my_ip = local_ip_toward(ip); mac, mac_str = wifi_mac_toward(ip)
-    key = load_key()
+    key = args.password
     print(f"Status {ip} (client MAC {mac_str}, IP {my_ip}):")
     p18, p19 = tcp_open(ip, SCAN_PORT), tcp_open(ip, HS_PORT)
     print(f"  53218 scan     : {'open' if p18 else 'dicht'}")
@@ -685,7 +572,7 @@ def cmd_status(args):
     if err == 0:
         d6_release(ip, mac)
     meaning = {0: "VRIJ", -4: "BUSY/LOCKED — gebruik 'release'",
-               -7: "gepaird aan ander IP", -3: "onbekende pairing key"}.get(err, "onbekend")
+               -7: "gekoppeld aan ander IP", -3: "verkeerd wachtwoord"}.get(err, "onbekend")
     print(f"  sessie-status  : err={err} ({meaning})")
     return 0
 
@@ -693,7 +580,7 @@ def cmd_paper(args):
     ip = _resolve_ip(args)
     if not ip: return 1
     my_ip = local_ip_toward(ip); mac, _ = wifi_mac_toward(ip)
-    st = read_status(ip, mac, my_ip, load_key())
+    st = read_status(ip, mac, my_ip, args.password)
     if st is None:
         print(f"Kon geen sessie krijgen op {ip} (probeer 'release')."); return 1
     p = paper_present(st.get("C2", b""))
@@ -704,9 +591,9 @@ def cmd_paper(args):
 def cmd_scan(args):
     ip = _resolve_ip(args)
     if not ip: return 1
-    key = load_key()
+    key = args.password
     if not key:
-        print("Geen pairing-key. Draai eerst 'scansnap pair'."); return 1
+        print("Geen wachtwoord. Gebruik -p/--password."); return 1
     my_ip = local_ip_toward(ip); mac, _ = wifi_mac_toward(ip)
     if not args.force:
         st = read_status(ip, mac, my_ip, key)
@@ -748,7 +635,7 @@ def cmd_release(args):
     ip = _resolve_ip(args)
     if not ip: return 1
     my_ip = local_ip_toward(ip); mac, _ = wifi_mac_toward(ip)
-    ok = grab_session(ip, mac, my_ip, load_key(), tries=args.rounds, verbose=True)
+    ok = grab_session(ip, mac, my_ip, args.password, tries=args.rounds, verbose=True)
     if ok:
         d6_release(ip, mac)
         print("✓ sessie vrij."); return 0
@@ -768,6 +655,10 @@ def main():
     ap = argparse.ArgumentParser(prog="scansnap", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    pwp = argparse.ArgumentParser(add_help=False)
+    pwp.add_argument("-p", "--password", type=password_arg, default=os.environ.get("SCANSNAP_PASSWORD"),
+                     help="ScanSnap password (default: 4 digits on the scanner); "
+                          "also read from $SCANSNAP_PASSWORD")
 
     d = sub.add_parser("discover", help="find scanners on the /24")
     d.add_argument("--timeout", type=float, default=0.5)
@@ -778,14 +669,14 @@ def main():
                           ("status", cmd_status, "session state"),
                           ("paper", cmd_paper, "paper in tray?"),
                           ("release", cmd_release, "clear session lock")]:
-        p = sub.add_parser(name, help=hlp)
+        p = sub.add_parser(name, help=hlp, parents=[pwp])
         p.add_argument("-s", "--scanner", dest="scanner", help="scanner IP")
         p.add_argument("ip", nargs="?", help="scanner IP (positional)")
         p.set_defaults(func=fn)
         if name == "release":
             p.add_argument("--rounds", type=int, default=8)
 
-    sc = sub.add_parser("scan", help="scan -> PDF")
+    sc = sub.add_parser("scan", help="scan -> PDF", parents=[pwp])
     sc.add_argument("-s", "--scanner", dest="scanner", help="scanner IP")
     sc.add_argument("-o", "--output", help="output file")
     sc.add_argument("--jpeg", action="store_true", help="save JPEGs instead of PDF")
@@ -793,11 +684,6 @@ def main():
     sc.add_argument("-d", "--debug", action="store_true")
     sc.set_defaults(func=cmd_scan)
 
-    pr = sub.add_parser("pair", help="capture pairing key (fake-scanner trick)")
-    pr.add_argument("--name", default="iX500",
-                    help="fake scanner name; some setups need the full model-serial, "
-                         "e.g. iX500-A0PBXXXXXX (check the label on your scanner)")
-    pr.set_defaults(func=cmd_pair)
     sub.add_parser("listen", help="watch 53220 broadcasts").set_defaults(func=cmd_listen)
 
     args = ap.parse_args()
