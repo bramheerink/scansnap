@@ -106,6 +106,11 @@ REGISTRATION (UDP PORT 52217)
      response. The other two magics typically time out — this appears
      to be normal.
 
+          The device info response starts with "VENS" followed by
+     0x00000000 (it has no length field, unlike the TCP packets).
+     The last 8 bytes (offset 124-131) are device-specific and must
+     be echoed back in the TCP handshake (offset 108, see below).
+
           Registration must be performed before the TCP handshake,
      and again after the init session before scanning.
 
@@ -128,24 +133,25 @@ TCP HANDSHAKE (PORT 53219)
        12      4     0x00000000
        16      6     Client MAC address
        22      10    Zero padding
-       32      4     0x00000006
-       36      1     0x1e
-       37      7     Zero padding
-       44      4     0x00000001
-       48      4     Client IP address
+       32      4     0x00061e00
+       36      4     Zero padding
+       40      4     0x00000001
+       44      4     Client IP address
+       48      2     Zero padding
        50      2     0xd7e1 (callback port = 55265)
-       52      12    Pairing key (see PAIRING KEY)
-       64      16    Zero padding
-       80      2     Year (big-endian, e.g. 0x07ea = 2026)
-       82      1     Month
-       83      1     Day
-       84      1     Hour
-       85      1     Minute
-       86      1     Second
-       87      1     0x00
-       88      8     Unknown (observed: 0x36c7c7e47a800000)
-       96      4     0xffff9d90
-       100     28    Zero padding
+       52      48    Password (see PASSWORD), zero padded
+       100     2     Year (big-endian, e.g. 0x07ea = 2026)
+       102     1     Month
+       103     1     Day
+       104     1     Hour
+       105     1     Minute
+       106     1     Second
+       107     1     0x00
+       108     8     Device tail: bytes 124-131 of the registration
+                     reply (see REGISTRATION)
+       116     4     Local UTC offset, signed big-endian seconds
+                     (observed: 0xffff9d90 = -25200)
+       120     8     Zero padding
 
           Scanner responds with 20 bytes. Byte offset 8 contains a
      signed big-endian 32-bit status code:
@@ -153,10 +159,10 @@ TCP HANDSHAKE (PORT 53219)
         0   Success
        -1   Bad packet format
        -2   Scanner serial mismatch
-       -3   Unknown pairing key
+       -3   Wrong password
        -4   Session busy / stale session
        -5   No serial in packet
-       -7   Client IP mismatch (scanner paired to different client)
+       -7   Client IP mismatch (scanner bound to a different client)
 
      Connection 2 — Device Query
 
@@ -173,30 +179,27 @@ TCP HANDSHAKE (PORT 53219)
      session from background threads.
 
 
-PAIRING KEY
+PASSWORD
 
-          The 12-byte ASCII string at offset 52 of the registration
-     packet is the pairing key. This is the serial number of the
-     Silex WiFi module inside the scanner — not the ScanSnap product
-     serial number.
+          The 48-byte field at offset 52 of the registration packet
+     holds the ScanSnap password (1-16 characters; the default is
+     four digits printed on the scanner and can be changed in
+     ScanSnap Home). Each character is sent as a 3-digit ASCII
+     decimal:
 
-          The scanner validates this key against its own WiFi module
-     serial. If the key is wrong, the scanner responds with error
-     -3. If the key is correct but the client IP does not match the
-     paired client, the scanner responds with error -7.
+       value[i] = ord(password[i]) + mask[i] + 11
+       mask     = "pFusCANsNapFiPfu"
 
-          The pairing key is established when the scanner is first
-     configured via the ScanSnap Home application (macOS/Windows).
-     The scanner never sends this key to the client — the client
-     must already know it.
+     For example, the password "1234" is sent as "172131179178"
+     (12 bytes), zero padded to 48 bytes.
 
-          To obtain the key on Linux without the official software,
-     broadcast discovery packets on the local network while ScanSnap
-     Home is running on another machine. ScanSnap Home will
-     automatically attempt to register and send its 128-byte
-     handshake packet containing the key. The real scanner must be
-     powered off or disconnected during this process to prevent
-     ScanSnap Home from connecting to it instead.
+          If the password is wrong, the scanner responds with error
+     -3. If it is correct but the client IP does not match the
+     client the scanner is bound to, it responds with error -7.
+
+          No separate pairing step is needed. Earlier versions of
+     this document described a "pairing key" that had to be
+     captured from ScanSnap Home; that field is this password.
 
 
 SCAN SESSION (TCP PORT 53218)
